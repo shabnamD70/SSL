@@ -20,6 +20,7 @@ import torchvision.models as models
 import pdb
 import torch.nn.functional as F
 import numpy as np
+from utils import AverageMeter, ProgressMeter, cross_entropy_OH, accuracy, adjust_learning_rate
 
 
 from PIL import ImageFile
@@ -217,20 +218,40 @@ def main_worker(gpu, ngpus_per_node, args):
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+    train_transform = transforms.Compose([
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ])
+    val_transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ])
+
+    train_dataset = datasets.ImageFolder(traindir, train_transform)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, shuffle=(train_sampler is None), batch_size=args.batch_size, pin_memory=True,
+        num_workers=args.workers,sampler=train_sampler)
+
+
+    val_dataset = datasets.ImageFolder(valdir, val_transform)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, shuffle=False, batch_size=args.batch_size, pin_memory=True,
+        num_workers=args.workers)
 
     ### Added by me    
     num_classes = len(train_dataset.classes)
-    num_classes = 1000
     print('num_classes:',num_classes)
 
     # when one-hot encoding: 1-p assigend to correct class, p assigend to all the rest of classes based on a dist
@@ -238,7 +259,7 @@ def main_worker(gpu, ngpus_per_node, args):
     mult_dotp = 1/args.tau # 1/tau in temperature softmax
     print('**mult_dotp:',mult_dotp)
     # make soft labels
-    sim_mat = np.load('sim_mat_imagenet.npy')
+    sim_mat = np.load('/home/sd73/CNN/pytorch_example/sim_mat_imagenet.npy')
     q_dist = np.zeros((num_classes,num_classes))
     # Find similarity of correct class with all the rest classes and find prob by softmax
     for ii in range(num_classes):
@@ -249,28 +270,6 @@ def main_worker(gpu, ngpus_per_node, args):
         q_dist[ii,:] = p_tot_rest * exps/sum(exps)
         q_dist[ii,ii] = 1 - p_tot_rest
 
-
-
-
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
         validate(val_loader, model, criterion, args)
@@ -318,7 +317,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes, q
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
-        #pdb.set_trace()
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -331,7 +329,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes, q
         output = model(images)
         #loss = criterion(output, target)
         #### Added by me 
-        #pdb.set_trace()
         one_hot_hard = F.one_hot(target, num_classes=num_classes)
 
         y_train_sl = np.zeros((target.shape[0],q_dist.shape[0]))
@@ -340,8 +337,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes, q
         one_hot = torch.from_numpy(y_train_sl).cuda(args.gpu, non_blocking=True)
         
         loss = args.alpha * cross_entropy_OH(output, one_hot) + (1-args.alpha) * cross_entropy_OH(output, one_hot_hard) # alpha * soft_loss + (1-alpha) * hard_loss
-        #print('**one_hot1.shape**:',one_hot1.shape)
-        #print('**one_hot.shape**:',one_hot.shape)
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
@@ -356,7 +351,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes, q
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
         if i % args.print_freq == 0:
             progress.display(i)
 
@@ -406,81 +400,10 @@ def validate(val_loader, model, criterion, args):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, args,  filename='checkpoint_testtttt27Dec2021.pth.tar'):
+def save_checkpoint(state, is_best, args,  filename='checkpoint.tar'):
     torch.save(state, 'arch_'+str(args.arch)+'_B'+str(args.batch_size)+'_seed'+str(args.seed)+'_prob'+str(args.prob)+'_tau'+str(args.tau)+'_alpha'+str(args.alpha)+'_SL_'+filename)
     if is_best:
-        shutil.copyfile('arch_'+str(args.arch)+'_B'+str(args.batch_size)+'_seed'+str(args.seed)+'_prob'+str(args.prob)+'_tau'+str(args.tau)+'_alpha'+str(args.alpha)+'_SL_'+filename, 'arch_'+str(args.arch)+'_B'+str(args.batch_size)+'_seed'+str(args.seed)+'_prob'+str(args.prob)+'_tau'+str(args.tau)+'_alpha'+str(args.alpha)+'_SL_model_best_testttt27Dec21.pth.tar')
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self, name, fmt=':f'):
-        self.name = name
-        self.fmt = fmt
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
-        return fmtstr.format(**self.__dict__)
-
-
-class ProgressMeter(object):
-    def __init__(self, num_batches, meters, prefix=""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
-    def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
-
-    def _get_batch_fmtstr(self, num_batches):
-        num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
-        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
-
-def cross_entropy_OH(score,one_hot):
-    
-    log_prob = F.log_softmax(score, dim=1)
-    #pdb.set_trace()
-    loss = -torch.sum(log_prob * one_hot) / one_hot.shape[0]
-    return loss
-
-def adjust_learning_rate(optimizer, epoch, args):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+        shutil.copyfile('arch_'+str(args.arch)+'_B'+str(args.batch_size)+'_seed'+str(args.seed)+'_prob'+str(args.prob)+'_tau'+str(args.tau)+'_alpha'+str(args.alpha)+'_SL_'+filename, 'arch_'+str(args.arch)+'_B'+str(args.batch_size)+'_seed'+str(args.seed)+'_prob'+str(args.prob)+'_tau'+str(args.tau)+'_alpha'+str(args.alpha)+'_SL_model_best.pth.tar')
 
 
 if __name__ == '__main__':
