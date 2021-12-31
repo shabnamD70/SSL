@@ -4,19 +4,8 @@ import random
 import shutil
 import time
 import warnings
-
 import torch
 import torch.nn as nn
-# import torch.nn.parallel
-# import torch.backends.cudnn as cudnn
-# import torch.distributed as dist
-# import torch.optim
-# import torch.multiprocessing as mp
-# import torch.utils.data
-# import torch.utils.data.distributed
-# import torchvision.transforms as transforms
-# import torchvision.datasets as datasets
-# import torchvision.models as models
 import pdb
 import torch.nn.functional as F
 import numpy as np
@@ -64,9 +53,38 @@ class ProgressMeter(object):
 
 def cross_entropy_OH(score,one_hot):
     
-    log_prob = F.log_softmax(score, dim=1)
+    log_prob = F.log_softmax(score, dim=1) ### Scores are the logits (not normalized)
     #pdb.set_trace()
     loss = -torch.sum(log_prob * one_hot) / one_hot.shape[0]
+    return loss
+
+# custom loss: CE of hard-label & CE of soft-label
+def CE_HL_SL(hs_alpha,y_true,y_pred, num_classes):
+    
+    log_prob = F.log_softmax(y_pred, dim=1)
+    ce_hard = -torch.sum(log_prob * y_true[:,:num_classes]) / (y_true[:,:num_classes].shape[0])
+    ce_soft = -torch.sum(log_prob * y_true[:,num_classes:]) / (y_true[:,num_classes:].shape[0])
+#     ce_hard = cross_entropy_OH(y_pred, y_true[:,:num_classes])
+#     ce_soft = cross_entropy_OH(y_pred, y_true[:,num_classes:])
+    loss = (1-hs_alpha) * ce_hard + hs_alpha * ce_soft
+    retrun loss
+        
+# custom loss: CE of labeled data & Entropy of unlabeled data
+def lu_loss_semi_SL_HL(lu_alpha,hs_alpha,y_true,y_pred, num_classes):
+
+    unlbl_indc = (1-torch.sum(y_true,axis=1)).float()
+    log_prob = F.log_softmax(y_pred, dim=1)
+    ce_lbl_HL = -torch.sum(log_prob * y_true[:,:num_classes]) / (torch.sum(1-unlbl_indc))# avg of CE of labeled samples
+    ce_lbl_SL = -torch.sum(log_prob * y_true[:,num_classes:]) / (torch.sum(1-unlbl_indc))# avg of CE of labeled samples
+    
+    # y_pred: B * num_classes ; ce_y_pred_ysl: B * num_classes = - log(y_pred) * y_sl 
+    ce_ypred_ysl = torch.matmul(-log_prob,torch.transpose(q_dist,0,1)) ### cast to float32????
+    
+    expect_ce = torch.sum(F.softmax(y_pred) * ce_ypred_ysl,axis=1) # expectation of CE 
+    h_unlbl = torch.sum(unlbl_indc * expect_ce,axis=-1)/torch.sum(unlbl_indc) # avg of H of unlabeled samples
+    # final loss
+    loss_labeled = (1-hs_alpha) * ce_lbl_HL + hs_alpha * ce_lbl_SL
+    loss = (1-lu_alpha) * loss_labeled + lu_alpha * h_unlbl
     return loss
 
 def adjust_learning_rate(optimizer, epoch, args):
